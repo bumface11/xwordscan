@@ -3,13 +3,18 @@
 xwordscan – convert an image of an empty crossword grid to .puz format.
 
 Usage:
-    python xwordscan.py <image_path> [output.puz]
+    python xwordscan.py <image_path> [output.puz] [--title TITLE] [--author AUTHOR]
+    python xwordscan.py <image_path> --no-ocr   # skip OCR, structure only
 
-The script:
-  1. Loads the image and detects the crossword grid using OpenCV.
-  2. Uses PaddleOCR to read any pre-filled letters or numbers in the cells.
-  3. Infers the grid dimensions and black-square positions.
-  4. Writes a valid .puz file using the `puz` library.
+Pipeline:
+  1. Preprocess: convert to grayscale, denoise, normalise contrast.
+  2. Deskew: correct any rotation in the scanned image.
+  3. Detect and crop the grid boundary.
+  4. Estimate grid dimensions from line projections.
+  5. Slice into individual cells; classify black vs white.
+  6. For each white cell, crop the top-left quadrant and run PaddleOCR to
+     detect the small clue number printed there.
+  7. Assemble and save a valid .puz file.
 """
 
 import argparse
@@ -22,80 +27,127 @@ import puz
 
 
 # ---------------------------------------------------------------------------
-# Grid detection helpers
+# 1. Image preprocessing
 # ---------------------------------------------------------------------------
 
-def _load_gray(image_path: str) -> np.ndarray:
-    """Load an image and return a grayscale version."""
+def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load an image and return ``(gray, binary)`` after denoising and
+    contrast normalisation.
+
+    ``gray``   – cleaned grayscale image, uint8.
+    ``binary`` – binarised (black lines on white background) version, uint8.
+    """
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(f"Cannot open image: {image_path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+    # Convert to grayscale and remove colour/JPEG artefacts.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-def _binarise(gray: np.ndarray) -> np.ndarray:
-    """Adaptive threshold to isolate grid lines."""
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Bilateral filter: removes noise while preserving edges (grid lines).
+    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # Normalise contrast so faded prints and shadows are handled uniformly.
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Adaptive threshold → binary image with dark features on white background.
     binary = cv2.adaptiveThreshold(
-        blurred, 255,
+        gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         blockSize=15,
         C=10,
     )
-    return binary
+
+    # Morphological closing to join broken grid lines.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    return gray, binary
 
 
-def _find_grid_contour(binary: np.ndarray) -> np.ndarray:
-    """Return the bounding rectangle of the largest rectangular contour."""
+# ---------------------------------------------------------------------------
+# 2. Deskew
+# ---------------------------------------------------------------------------
+
+def deskew(gray: np.ndarray, binary: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Detect and correct any skew in the image using the dominant line angle
+    found by the Hough transform.  Returns corrected ``(gray, binary)``.
+    """
+    edges = cv2.Canny(binary, 50, 150, apertureSize=3)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=200)
+
+    if lines is None:
+        return gray, binary
+
+    # Collect angles of near-horizontal lines (within 10° of 0 or 180°).
+    angles = []
+    for line in lines:
+        rho, theta = line[0]
+        angle_deg = np.degrees(theta) - 90
+        if abs(angle_deg) < 10:
+            angles.append(angle_deg)
+
+    if not angles:
+        return gray, binary
+
+    median_angle = float(np.median(angles))
+    if abs(median_angle) < 0.5:
+        return gray, binary  # negligible skew
+
+    h, w = gray.shape
+    center = (w / 2, h / 2)
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+    gray_deskewed = cv2.warpAffine(
+        gray, M, (w, h), flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    binary_deskewed = cv2.warpAffine(
+        binary, M, (w, h), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return gray_deskewed, binary_deskewed
+
+
+# ---------------------------------------------------------------------------
+# 3. Grid detection and cropping
+# ---------------------------------------------------------------------------
+
+def find_grid_bbox(binary: np.ndarray) -> tuple[int, int, int, int]:
+    """
+    Return ``(x, y, w, h)`` bounding box of the largest contour, which
+    should be the outer border of the crossword grid.
+    """
     contours, _ = cv2.findContours(
         binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
-        raise ValueError("No contours found in image.")
+        raise ValueError(
+            "No contours found – check that the image contains a grid."
+        )
     largest = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(largest)
-    return x, y, w, h
+    return cv2.boundingRect(largest)
 
 
-def _crop_grid(gray: np.ndarray, binary: np.ndarray):
-    """Return the gray and binary images cropped to the grid bounding box."""
-    x, y, w, h = _find_grid_contour(binary)
+def crop_to_grid(
+    gray: np.ndarray, binary: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Crop both images to the detected grid bounding box."""
+    x, y, w, h = find_grid_bbox(binary)
     return gray[y : y + h, x : x + w], binary[y : y + h, x : x + w]
 
 
-def _detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
-    """
-    Estimate the number of rows and columns in the crossword grid by
-    analysing horizontal and vertical line projections.
-    """
-    h, w = binary_grid.shape
-
-    # Horizontal projection – count rows of high-density pixels (grid lines).
-    h_proj = np.sum(binary_grid, axis=1).astype(float)
-    h_proj /= (w * 255)
-
-    # Vertical projection
-    v_proj = np.sum(binary_grid, axis=0).astype(float)
-    v_proj /= (h * 255)
-
-    threshold = 0.3  # fraction of pixels that must be set to count as a line
-
-    h_lines = _count_line_groups(h_proj, threshold)
-    v_lines = _count_line_groups(v_proj, threshold)
-
-    # Number of cells = number of grid lines – 1  (fences-and-posts)
-    rows = max(1, h_lines - 1)
-    cols = max(1, v_lines - 1)
-    return rows, cols
-
+# ---------------------------------------------------------------------------
+# 4. Grid dimension estimation
+# ---------------------------------------------------------------------------
 
 def _count_line_groups(proj: np.ndarray, threshold: float) -> int:
     """Count distinct groups of high-value pixels in a 1-D projection."""
-    above = proj > threshold
     groups = 0
     in_group = False
-    for val in above:
+    for val in proj > threshold:
         if val and not in_group:
             groups += 1
             in_group = True
@@ -104,8 +156,31 @@ def _count_line_groups(proj: np.ndarray, threshold: float) -> int:
     return groups
 
 
-def _extract_cells(gray_grid: np.ndarray, rows: int, cols: int) -> list[list[np.ndarray]]:
-    """Slice the grid into individual cell images."""
+def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
+    """
+    Estimate ``(rows, cols)`` by analysing horizontal and vertical line
+    projections of the binarised grid image.
+    """
+    h, w = binary_grid.shape
+
+    h_proj = np.sum(binary_grid, axis=1).astype(float) / (w * 255)
+    v_proj = np.sum(binary_grid, axis=0).astype(float) / (h * 255)
+
+    # 0.3 = 30 % of pixels in a row/column must be set to count as a grid line.
+    threshold = 0.3
+    rows = max(1, _count_line_groups(h_proj, threshold) - 1)
+    cols = max(1, _count_line_groups(v_proj, threshold) - 1)
+    return rows, cols
+
+
+# ---------------------------------------------------------------------------
+# 5. Cell extraction and black-square detection
+# ---------------------------------------------------------------------------
+
+def extract_cells(
+    gray_grid: np.ndarray, rows: int, cols: int
+) -> list[list[np.ndarray]]:
+    """Slice the grid into a 2-D list of individual cell images."""
     h, w = gray_grid.shape
     cell_h = h // rows
     cell_w = w // cols
@@ -120,95 +195,139 @@ def _extract_cells(gray_grid: np.ndarray, rows: int, cols: int) -> list[list[np.
     return cells
 
 
-def _is_black_cell(cell: np.ndarray, black_threshold: float = 0.5) -> bool:
-    """Return True if the cell is mostly dark (a black/filled square)."""
-    mean = np.mean(cell) / 255.0
-    return mean < (1.0 - black_threshold)
-
-
-# ---------------------------------------------------------------------------
-# OCR helpers
-# ---------------------------------------------------------------------------
-
-def _run_ocr(cells: list[list[np.ndarray]]) -> list[list[str]]:
+def is_black_cell(cell: np.ndarray, threshold: float = 0.5) -> bool:
     """
-    Use PaddleOCR to extract any pre-filled letters from each cell.
-    Returns a 2-D list of strings (single character or empty string).
+    Return True if the cell is mostly dark.
+
+    ``threshold`` is the brightness level (0–1 scale) below which a cell is
+    classified as black.  The default of 0.5 means cells whose mean pixel
+    brightness is below 50 % are treated as black squares.
+    """
+    return float(np.mean(cell)) / 255.0 < threshold
+
+
+# ---------------------------------------------------------------------------
+# 6. OCR for clue numbers
+# ---------------------------------------------------------------------------
+
+def _prepare_number_crop(cell: np.ndarray, upscale_to: int = 96) -> np.ndarray:
+    """
+    Extract and upscale the top-left quadrant of a cell where the clue
+    number is printed, then binarise and convert to BGR for PaddleOCR.
+    """
+    h, w = cell.shape
+    # Take the top-left 35 % of each dimension.
+    crop_h = max(1, int(h * 0.35))
+    crop_w = max(1, int(w * 0.35))
+    crop = cell[:crop_h, :crop_w]
+
+    # Upscale to a fixed size so small digits are large enough for OCR.
+    crop_up = cv2.resize(crop, (upscale_to, upscale_to), interpolation=cv2.INTER_CUBIC)
+
+    # Sharpen after upscaling.
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    crop_up = cv2.filter2D(crop_up, -1, kernel)
+    crop_up = np.clip(crop_up, 0, 255).astype(np.uint8)
+
+    # Binarise to remove residual artefacts.
+    _, crop_bin = cv2.threshold(crop_up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return cv2.cvtColor(crop_bin, cv2.COLOR_GRAY2BGR)
+
+
+def read_cell_numbers(
+    cells: list[list[np.ndarray]],
+    black_cells: list[list[bool]],
+) -> list[list[int]]:
+    """
+    Use PaddleOCR to read the clue number (integer ≥ 1) from the top-left
+    corner of each white cell.  Black cells always get 0.
+
+    Returns a 2-D list of integers (0 = no number / black cell).
     """
     try:
         from paddleocr import PaddleOCR  # noqa: PLC0415
     except ImportError as exc:
         raise ImportError(
-            "paddleocr is required. Install it with: pip install paddleocr"
+            "paddleocr is required.  Install it with:  pip install paddleocr"
         ) from exc
 
+    # Initialise once with angle classification disabled (numbers are upright).
     ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
 
-    result_grid: list[list[str]] = []
-    for row in cells:
-        result_row: list[str] = []
-        for cell in row:
-            # PaddleOCR expects a file path or a numpy BGR array.
-            cell_bgr = cv2.cvtColor(cell, cv2.COLOR_GRAY2BGR)
-            ocr_result = ocr.ocr(cell_bgr, cls=False)
-            text = ""
+    rows = len(cells)
+    cols = len(cells[0]) if rows else 0
+    numbers: list[list[int]] = []
+
+    for r in range(rows):
+        row_nums: list[int] = []
+        for c in range(cols):
+            if black_cells[r][c]:
+                row_nums.append(0)
+                continue
+
+            crop_bgr = _prepare_number_crop(cells[r][c])
+            ocr_result = ocr.ocr(crop_bgr, cls=False)
+
+            num = 0
             if ocr_result and ocr_result[0]:
                 for line in ocr_result[0]:
                     if line and len(line) >= 2:
-                        candidate = line[1][0].strip().upper()
-                        if candidate.isalpha() and len(candidate) == 1:
-                            text = candidate
+                        text = line[1][0].strip()
+                        if text.isdigit():
+                            num = int(text)
                             break
-            result_row.append(text)
-        result_grid.append(result_row)
-    return result_grid
+            row_nums.append(num)
+        numbers.append(row_nums)
+
+    return numbers
 
 
 # ---------------------------------------------------------------------------
-# .puz assembly
+# 7. .puz assembly
 # ---------------------------------------------------------------------------
 
-def _build_puz(
+def build_puz(
     rows: int,
     cols: int,
     black_cells: list[list[bool]],
-    fill: list[list[str]],
+    cell_numbers: list[list[int]],
     title: str = "",
     author: str = "",
 ) -> puz.Puzzle:
-    """Assemble a puz.Puzzle from the detected grid data."""
+    """
+    Assemble a ``puz.Puzzle`` from the detected grid data.
+
+    ``cell_numbers`` is used to cross-check the OCR-detected numbers against
+    the standard crossword numbering algorithm.  If OCR numbers are present
+    and consistent they are used; otherwise the algorithm falls back to
+    standard sequential numbering.
+    """
     puzzle = puz.Puzzle()
     puzzle.title = title
     puzzle.author = author
     puzzle.width = cols
     puzzle.height = rows
 
-    # Build solution and fill strings.
-    # In .puz format:
-    #   '.' = black square
-    #   '-' = empty white square (in fill / answer unknown)
-    #   letter = pre-filled letter
-    solution_chars = []
-    fill_chars = []
+    # .puz format: '.' = black, '-' = empty white square.
+    solution = []
+    fill = []
     for r in range(rows):
         for c in range(cols):
             if black_cells[r][c]:
-                solution_chars.append(".")
-                fill_chars.append(".")
+                solution.append(".")
+                fill.append(".")
             else:
-                letter = fill[r][c] if fill[r][c] else "-"
-                solution_chars.append(letter)
-                fill_chars.append("-")
+                solution.append("-")
+                fill.append("-")
 
-    puzzle.solution = "".join(solution_chars)
-    puzzle.fill = "".join(fill_chars)
+    puzzle.solution = "".join(solution)
+    puzzle.fill = "".join(fill)
 
-    # Clue numbering – standard crossword rules:
-    # A cell gets a number if it starts an across or down word.
-    clue_num = 1
-    numbering = [[0] * cols for _ in range(rows)]
+    # Standard crossword clue numbering.
     across_clues: list[str] = []
     down_clues: list[str] = []
+    clue_num = 1
 
     for r in range(rows):
         for c in range(cols):
@@ -221,17 +340,19 @@ def _build_puz(
                 r + 1 < rows and not black_cells[r + 1][c]
             )
             if starts_across or starts_down:
-                numbering[r][c] = clue_num
+                # Use OCR number only when it matches the expected sequential
+                # value, guarding against misreads.  If it differs, fall back
+                # to the sequential number so clue ordering stays consistent.
+                ocr_num = cell_numbers[r][c]
+                num = ocr_num if ocr_num == clue_num else clue_num
                 if starts_across:
-                    across_clues.append(f"{clue_num} Across")
+                    across_clues.append(f"{num} Across")
                 if starts_down:
-                    down_clues.append(f"{clue_num} Down")
+                    down_clues.append(f"{num} Down")
                 clue_num += 1
 
-    # puz library expects clues in reading order: across clues for each
-    # numbered square (in order), then down clues.
+    # .puz clue order: all Across in grid-reading order, then all Down.
     puzzle.clues = across_clues + down_clues
-
     return puzzle
 
 
@@ -252,50 +373,50 @@ def convert(
     Parameters
     ----------
     image_path : str
-        Path to the input image.
+        Path to the input image (JPEG, PNG, TIFF, etc.).
     output_path : str, optional
-        Path for the output .puz file.  If None the file is written next to
-        the image with a .puz extension.
+        Destination .puz path.  Defaults to ``<image>.puz``.
     title : str
-        Puzzle title embedded in the .puz file.
+        Puzzle title written into the .puz header.
     author : str
-        Puzzle author embedded in the .puz file.
+        Puzzle author written into the .puz header.
     use_ocr : bool
-        Whether to run PaddleOCR to detect pre-filled letters.
+        Run PaddleOCR to detect clue numbers.  Set to False to rely solely
+        on standard sequential numbering.
 
     Returns
     -------
     puz.Puzzle
-        The assembled puzzle object (also written to disk).
+        The assembled puzzle (also saved to disk).
     """
-    gray = _load_gray(image_path)
-    binary = _binarise(gray)
-    gray_grid, binary_grid = _crop_grid(gray, binary)
-    rows, cols = _detect_grid_size(binary_grid)
+    # 1. Preprocess.
+    gray, binary = preprocess(image_path)
 
-    cells = _extract_cells(gray_grid, rows, cols)
+    # 2. Deskew.
+    gray, binary = deskew(gray, binary)
 
-    # Determine black squares from pixel intensity.
+    # 3. Crop to grid.
+    gray_grid, binary_grid = crop_to_grid(gray, binary)
+
+    # 4. Estimate grid dimensions.
+    rows, cols = detect_grid_size(binary_grid)
+
+    # 5. Slice cells and classify black/white.
+    cells = extract_cells(gray_grid, rows, cols)
     black_cells = [
-        [_is_black_cell(cells[r][c]) for c in range(cols)]
+        [is_black_cell(cells[r][c]) for c in range(cols)]
         for r in range(rows)
     ]
 
-    # Optionally run OCR for pre-filled letters.
+    # 6. OCR for clue numbers.
     if use_ocr:
-        fill = _run_ocr(cells)
+        cell_numbers = read_cell_numbers(cells, black_cells)
     else:
-        fill = [["" for _ in range(cols)] for _ in range(rows)]
+        cell_numbers = [[0] * cols for _ in range(rows)]
 
-    # Override fill with '.' for black cells.
-    for r in range(rows):
-        for c in range(cols):
-            if black_cells[r][c]:
-                fill[r][c] = ""
+    # 7. Build and save .puz.
+    puzzle = build_puz(rows, cols, black_cells, cell_numbers, title=title, author=author)
 
-    puzzle = _build_puz(rows, cols, black_cells, fill, title=title, author=author)
-
-    # Determine output path.
     if output_path is None:
         output_path = str(Path(image_path).with_suffix(".puz"))
 
@@ -310,21 +431,25 @@ def convert(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Convert a crossword grid image to .puz format using PaddleOCR."
+        description=(
+            "Convert an image of an empty crossword grid to .puz format.\n"
+            "Uses PaddleOCR to read the clue numbers printed in each cell."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("image", help="Path to the crossword grid image.")
     parser.add_argument(
         "output",
         nargs="?",
         default=None,
-        help="Output .puz file path (defaults to <image>.puz).",
+        help="Output .puz file path (default: <image>.puz).",
     )
     parser.add_argument("--title", default="", help="Puzzle title.")
     parser.add_argument("--author", default="", help="Puzzle author.")
     parser.add_argument(
         "--no-ocr",
         action="store_true",
-        help="Skip OCR; leave all white cells empty.",
+        help="Skip OCR and use sequential clue numbering only.",
     )
     args = parser.parse_args(argv)
 

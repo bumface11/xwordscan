@@ -1,0 +1,5 @@
+opencv-python>=4.8
+numpy>=1.24
+paddlepaddle>=2.6
+paddleocr>=2.7
+puzpy>=0.6
