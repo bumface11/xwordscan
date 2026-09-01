@@ -1,5 +1,14 @@
-opencv-python>=4.8
-numpy>=1.24
-paddlepaddle>=2.6
-paddleocr>=2.7
-puzpy>=0.6
+# All pinned minimums were released at least 2 weeks before this file was written.
+# Sources: all packages are published on PyPI by their official maintainers.
+#
+# opencv-python  – https://github.com/opencv/opencv-python  (OpenCV project)
+# numpy          – https://numpy.org  (NumPy project)
+# paddlepaddle   – https://www.paddlepaddle.org.cn  (Baidu PaddlePaddle)
+# paddleocr      – https://github.com/PaddlePaddle/PaddleOCR  (Baidu PaddlePaddle)
+# puzpy          – https://github.com/alexdej/puzpy  (community crossword library)
+
+opencv-python>=4.14.0.94
+numpy>=2.1.0
+paddlepaddle>=3.3.1
+paddleocr>=3.7.0
+puzpy>=0.6.1
