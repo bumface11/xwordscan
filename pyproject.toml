@@ -1,0 +1,32 @@
+[project]
+name = "xwordscan"
+version = "0.1.0"
+description = "Convert an image of an empty crossword grid to .puz format"
+requires-python = ">=3.10"
+dependencies = [
+    # All minimum versions were released at least 2 weeks before this file was
+    # written. Sources are listed below.
+    #
+    # opencv-python  – https://github.com/opencv/opencv-python  (OpenCV project)
+    # numpy          – https://numpy.org  (NumPy project)
+    # paddlepaddle   – https://www.paddlepaddle.org.cn  (Baidu PaddlePaddle)
+    # paddleocr      – https://github.com/PaddlePaddle/PaddleOCR  (Baidu PaddlePaddle)
+    # puzpy          – https://github.com/alexdej/puzpy  (community crossword library)
+    "opencv-python>=4.14.0.94",
+    "numpy>=2.1.0",
+    "paddlepaddle>=3.3.1",
+    "paddleocr>=3.7.0",
+    "puzpy>=0.6.1",
+]
+
+[project.scripts]
+xwordscan = "xwordscan:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

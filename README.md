@@ -15,13 +15,37 @@ A utility to convert an image of an empty crossword grid to [.puz format](https:
 ## Requirements
 
 - Python 3.10+
-- [PaddlePaddle](https://www.paddlepaddle.org.cn/en) (CPU build is sufficient)
-- PaddleOCR
-- OpenCV
-- NumPy
-- [puz](https://github.com/alexdej/puzpy)
+- [uv](https://docs.astral.sh/uv/) (recommended) **or** pip
 
-Install all dependencies:
+Dependencies (all from official PyPI maintainers, pinned to versions ≥ 2 weeks old):
+
+| Package | Source |
+|---|---|
+| `opencv-python` | [opencv/opencv-python](https://github.com/opencv/opencv-python) |
+| `numpy` | [numpy.org](https://numpy.org) |
+| `paddlepaddle` | [paddlepaddle.org.cn](https://www.paddlepaddle.org.cn) (CPU build sufficient) |
+| `paddleocr` | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) |
+| `puzpy` | [alexdej/puzpy](https://github.com/alexdej/puzpy) |
+
+### Install with uv (recommended)
+
+[uv](https://docs.astral.sh/uv/) installs exact versions from the committed `uv.lock` file,
+guaranteeing reproducible, auditable installs regardless of when you run the command.
+
+```bash
+# Install uv (one-time)
+pip install uv
+
+# Create a virtual environment and install locked dependencies
+uv sync
+
+# Run the tool inside the uv-managed environment
+uv run xwordscan grid.jpg
+```
+
+Use `uv sync --frozen` in CI to enforce the exact locked versions without allowing updates.
+
+### Install with pip (alternative)
 
 ```bash
 pip install -r requirements.txt
@@ -57,6 +81,6 @@ python xwordscan.py grid.png --no-ocr
 ## Running tests
 
 ```bash
-pip install pytest
-pytest tests/
+uv sync                  # installs dev dependencies including pytest
+uv run pytest tests/
 ```
