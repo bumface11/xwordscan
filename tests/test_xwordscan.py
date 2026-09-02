@@ -10,6 +10,7 @@ import pytest
 
 import sys
 import os
+import types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import xwordscan
@@ -137,6 +138,33 @@ class TestExtractCells:
         assert np.mean(cells[0][1]) == pytest.approx(128.0)
         assert np.mean(cells[1][0]) == pytest.approx(192.0)
         assert np.mean(cells[1][1]) == pytest.approx(255.0)
+
+
+# ---------------------------------------------------------------------------
+# read_cell_numbers
+# ---------------------------------------------------------------------------
+
+class TestReadCellNumbers:
+    def test_uses_paddleocr_3_arguments(self, monkeypatch):
+        created_with = {}
+
+        class FakeOCR:
+            def __init__(self, **kwargs):
+                created_with.update(kwargs)
+
+            def predict(self, image):
+                return [{"rec_texts": ["17"]}]
+
+        monkeypatch.setitem(sys.modules, "paddleocr", types.SimpleNamespace(PaddleOCR=FakeOCR))
+        cells = [[np.full((20, 20), 255, dtype=np.uint8)]]
+
+        assert xwordscan.read_cell_numbers(cells, [[False]]) == [[17]]
+        assert created_with == {
+            "lang": "en",
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        }
 
 
 # ---------------------------------------------------------------------------

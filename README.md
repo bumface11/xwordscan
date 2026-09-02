@@ -21,7 +21,7 @@ Dependencies (all from official PyPI maintainers, pinned to versions ≥ 2 weeks
 
 | Package | Source |
 |---|---|
-| `opencv-python` | [opencv/opencv-python](https://github.com/opencv/opencv-python) |
+| `opencv-python-headless` | [opencv/opencv-python](https://github.com/opencv/opencv-python) |
 | `numpy` | [numpy.org](https://numpy.org) |
 | `paddlepaddle` | [paddlepaddle.org.cn](https://www.paddlepaddle.org.cn) (CPU build sufficient) |
 | `paddleocr` | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) |
@@ -59,16 +59,16 @@ pip install -r requirements.txt
 
 ```bash
 # Basic usage – output written to <image>.puz
-python xwordscan.py grid.jpg
+uv run xwordscan grid.jpg
 
 # Specify output file
-python xwordscan.py grid.png my_puzzle.puz
+uv run xwordscan grid.png my_puzzle.puz
 
 # Add metadata
-python xwordscan.py grid.png --title "Daily Crossword" --author "A. Setter"
+uv run xwordscan grid.png --title "Daily Crossword" --author "A. Setter"
 
 # Skip OCR (use sequential clue numbering only)
-python xwordscan.py grid.png --no-ocr
+uv run xwordscan grid.png --no-ocr
 ```
 
 ## Tips for best results

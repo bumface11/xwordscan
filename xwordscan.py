@@ -252,8 +252,13 @@ def read_cell_numbers(
             "paddleocr is required.  Install it with:  pip install paddleocr"
         ) from exc
 
-    # Initialise once with angle classification disabled (numbers are upright).
-    ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+    # Clue numbers are upright crops, so document preprocessing is unnecessary.
+    ocr = PaddleOCR(
+        lang="en",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
 
     rows = len(cells)
     cols = len(cells[0]) if rows else 0
@@ -267,16 +272,17 @@ def read_cell_numbers(
                 continue
 
             crop_bgr = _prepare_number_crop(cells[r][c])
-            ocr_result = ocr.ocr(crop_bgr, cls=False)
+            ocr_results = ocr.predict(crop_bgr)
 
             num = 0
-            if ocr_result and ocr_result[0]:
-                for line in ocr_result[0]:
-                    if line and len(line) >= 2:
-                        text = line[1][0].strip()
-                        if text.isdigit():
-                            num = int(text)
-                            break
+            for result in ocr_results:
+                for text in result.get("rec_texts", []):
+                    text = text.strip()
+                    if text.isdigit():
+                        num = int(text)
+                        break
+                if num:
+                    break
             row_nums.append(num)
         numbers.append(row_nums)
 
