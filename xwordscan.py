@@ -27,11 +27,26 @@ import numpy as np
 import puz
 
 
+def _save_debug_image(
+    debug_dir: Path | None, filename: str, image: np.ndarray
+) -> None:
+    """Write a debug image when a debug directory is configured."""
+    if debug_dir is None:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    output_path = debug_dir / filename
+    if not cv2.imwrite(str(output_path), image):
+        raise OSError(f"Cannot write debug image: {output_path}")
+
+
 # ---------------------------------------------------------------------------
 # 1. Image preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
+def preprocess(
+    image_path: str, debug_dir: Path | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Load an image and return ``(gray, binary)`` after denoising and
     contrast normalisation.
@@ -45,12 +60,15 @@ def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
 
     # Convert to grayscale and remove colour/JPEG artefacts.
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _save_debug_image(debug_dir, "01-grayscale.png", gray)
 
     # Bilateral filter: removes noise while preserving edges (grid lines).
-    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    _save_debug_image(debug_dir, "02-denoised.png", denoised)
 
     # Normalise contrast so faded prints and shadows are handled uniformly.
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    gray = cv2.normalize(denoised, None, 0, 255, cv2.NORM_MINMAX)
+    _save_debug_image(debug_dir, "03-normalized.png", gray)
 
     # Adaptive threshold → binary image with dark features on white background.
     binary = cv2.adaptiveThreshold(
@@ -60,10 +78,12 @@ def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
         blockSize=15,
         C=10,
     )
+    _save_debug_image(debug_dir, "04-thresholded.png", binary)
 
     # Morphological closing to join broken grid lines.
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    _save_debug_image(debug_dir, "05-closed.png", binary)
 
     return gray, binary
 
@@ -239,6 +259,7 @@ def _prepare_number_crop(cell: np.ndarray, upscale_to: int = 96) -> np.ndarray:
 def read_cell_numbers(
     cells: list[list[np.ndarray]],
     black_cells: list[list[bool]],
+    debug_dir: Path | None = None,
 ) -> list[list[int]]:
     """
     Use PaddleOCR to read the clue number (integer ≥ 1) from the top-left
@@ -273,6 +294,11 @@ def read_cell_numbers(
                 continue
 
             crop_bgr = _prepare_number_crop(cells[r][c])
+            _save_debug_image(
+                debug_dir / "ocr-crops" if debug_dir else None,
+                f"row-{r + 1:02d}-col-{c + 1:02d}.png",
+                crop_bgr,
+            )
             ocr_results = ocr.predict(crop_bgr)
 
             num = 0
@@ -425,6 +451,7 @@ def convert(
     author: str = "",
     use_ocr: bool = True,
     output_format: str = "puz",
+    debug_dir: str | Path | None = None,
 ) -> puz.Puzzle | dict:
     """
     Convert a crossword grid image to a .puz file.
@@ -444,20 +471,28 @@ def convert(
         on standard sequential numbering.
     output_format : str
         Output format: ``puz`` (default) or ``ipuz``.
+    debug_dir : str or pathlib.Path, optional
+        Directory for intermediate preprocessing images and OCR input crops.
 
     Returns
     -------
     puz.Puzzle
         The assembled puzzle (also saved to disk).
     """
+    debug_path = Path(debug_dir) if debug_dir else None
+
     # 1. Preprocess.
-    gray, binary = preprocess(image_path)
+    gray, binary = preprocess(image_path, debug_dir=debug_path)
 
     # 2. Deskew.
     gray, binary = deskew(gray, binary)
+    _save_debug_image(debug_path, "06-deskewed-grayscale.png", gray)
+    _save_debug_image(debug_path, "07-deskewed-binary.png", binary)
 
     # 3. Crop to grid.
     gray_grid, binary_grid = crop_to_grid(gray, binary)
+    _save_debug_image(debug_path, "08-grid-grayscale.png", gray_grid)
+    _save_debug_image(debug_path, "09-grid-binary.png", binary_grid)
 
     # 4. Estimate grid dimensions.
     rows, cols = detect_grid_size(binary_grid)
@@ -471,7 +506,7 @@ def convert(
 
     # 6. OCR for clue numbers.
     if use_ocr:
-        cell_numbers = read_cell_numbers(cells, black_cells)
+        cell_numbers = read_cell_numbers(cells, black_cells, debug_dir=debug_path)
     else:
         cell_numbers = [[0] * cols for _ in range(rows)]
 
@@ -518,6 +553,12 @@ def main(argv=None):
     parser.add_argument("--title", default="", help="Puzzle title.")
     parser.add_argument("--author", default="", help="Puzzle author.")
     parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="Save intermediate processing images and OCR input crops here.",
+    )
+    parser.add_argument(
         "--format",
         choices=("puz", "ipuz"),
         default="puz",
@@ -538,6 +579,7 @@ def main(argv=None):
             author=args.author,
             use_ocr=not args.no_ocr,
             output_format=args.format,
+            debug_dir=args.debug_dir,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)

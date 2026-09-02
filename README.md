@@ -72,6 +72,9 @@ uv run xwordscan grid.png --no-ocr
 
 # Write an IPUZ file instead of PUZ
 uv run xwordscan grid.png --format ipuz
+
+# Save preprocessing stages and OCR input crops for inspection
+uv run xwordscan grid.png --debug-dir debug-images
 ```
 
 ## Tips for best results

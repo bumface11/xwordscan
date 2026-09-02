@@ -166,6 +166,21 @@ class TestReadCellNumbers:
             "use_textline_orientation": False,
         }
 
+    def test_saves_prepared_ocr_crop(self, monkeypatch, tmp_path):
+        class FakeOCR:
+            def __init__(self, **kwargs):
+                pass
+
+            def predict(self, image):
+                return [{"rec_texts": []}]
+
+        monkeypatch.setitem(sys.modules, "paddleocr", types.SimpleNamespace(PaddleOCR=FakeOCR))
+        cells = [[np.full((20, 20), 255, dtype=np.uint8)]]
+
+        xwordscan.read_cell_numbers(cells, [[False]], debug_dir=tmp_path)
+
+        assert (tmp_path / "ocr-crops" / "row-01-col-01.png").is_file()
+
 
 # ---------------------------------------------------------------------------
 # build_puz
@@ -261,6 +276,22 @@ class TestPreprocess:
         cv2.imwrite(img_path, np.full((100, 100, 3), 255, dtype=np.uint8))
         gray, binary = xwordscan.preprocess(img_path)
         assert gray.shape == binary.shape
+
+    def test_saves_intermediate_images(self, tmp_path):
+        import cv2  # noqa: PLC0415
+        img_path = str(tmp_path / "white.png")
+        cv2.imwrite(img_path, np.full((100, 100, 3), 255, dtype=np.uint8))
+
+        xwordscan.preprocess(img_path, debug_dir=tmp_path / "debug")
+
+        debug_dir = tmp_path / "debug"
+        assert {path.name for path in debug_dir.iterdir()} == {
+            "01-grayscale.png",
+            "02-denoised.png",
+            "03-normalized.png",
+            "04-thresholded.png",
+            "05-closed.png",
+        }
 
     def test_missing_file(self):
         with pytest.raises(FileNotFoundError):
