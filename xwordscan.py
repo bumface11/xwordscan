@@ -18,6 +18,7 @@ Pipeline:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -362,6 +363,57 @@ def build_puz(
     return puzzle
 
 
+def build_ipuz(
+    rows: int,
+    cols: int,
+    black_cells: list[list[bool]],
+    cell_numbers: list[list[int]],
+    title: str = "",
+    author: str = "",
+) -> dict:
+    """Assemble an IPUZ crossword document from the detected grid data."""
+    grid: list[list[int | str]] = []
+    across_clues: list[list[int | str]] = []
+    down_clues: list[list[int | str]] = []
+    clue_num = 1
+
+    for r in range(rows):
+        grid_row: list[int | str] = []
+        for c in range(cols):
+            if black_cells[r][c]:
+                grid_row.append("#")
+                continue
+
+            starts_across = (c == 0 or black_cells[r][c - 1]) and (
+                c + 1 < cols and not black_cells[r][c + 1]
+            )
+            starts_down = (r == 0 or black_cells[r - 1][c]) and (
+                r + 1 < rows and not black_cells[r + 1][c]
+            )
+            if starts_across or starts_down:
+                ocr_num = cell_numbers[r][c]
+                num = ocr_num if ocr_num == clue_num else clue_num
+                if starts_across:
+                    across_clues.append([num, f"{num} Across"])
+                if starts_down:
+                    down_clues.append([num, f"{num} Down"])
+                clue_num += 1
+            else:
+                num = 0
+            grid_row.append(num)
+        grid.append(grid_row)
+
+    return {
+        "version": "http://ipuz.org/v2",
+        "kind": ["http://ipuz.org/crossword#1"],
+        "title": title,
+        "author": author,
+        "dimensions": {"width": cols, "height": rows},
+        "puzzle": grid,
+        "clues": {"Across": across_clues, "Down": down_clues},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -372,7 +424,8 @@ def convert(
     title: str = "",
     author: str = "",
     use_ocr: bool = True,
-) -> puz.Puzzle:
+    output_format: str = "puz",
+) -> puz.Puzzle | dict:
     """
     Convert a crossword grid image to a .puz file.
 
@@ -389,6 +442,8 @@ def convert(
     use_ocr : bool
         Run PaddleOCR to detect clue numbers.  Set to False to rely solely
         on standard sequential numbering.
+    output_format : str
+        Output format: ``puz`` (default) or ``ipuz``.
 
     Returns
     -------
@@ -420,14 +475,24 @@ def convert(
     else:
         cell_numbers = [[0] * cols for _ in range(rows)]
 
-    # 7. Build and save .puz.
-    puzzle = build_puz(rows, cols, black_cells, cell_numbers, title=title, author=author)
+    # 7. Build and save the requested puzzle format.
+    if output_format == "puz":
+        puzzle = build_puz(rows, cols, black_cells, cell_numbers, title=title, author=author)
+    elif output_format == "ipuz":
+        puzzle = build_ipuz(rows, cols, black_cells, cell_numbers, title=title, author=author)
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
 
     if output_path is None:
-        output_path = str(Path(image_path).with_suffix(".puz"))
+        output_path = str(Path(image_path).with_suffix(f".{output_format}"))
 
-    puzzle.save(output_path)
-    print(f"Saved {rows}×{cols} puzzle to {output_path}")
+    if output_format == "puz":
+        puzzle.save(output_path)
+    else:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            json.dump(puzzle, output_file, indent=2)
+            output_file.write("\n")
+    print(f"Saved {rows}×{cols} {output_format.upper()} puzzle to {output_path}")
     return puzzle
 
 
@@ -453,6 +518,12 @@ def main(argv=None):
     parser.add_argument("--title", default="", help="Puzzle title.")
     parser.add_argument("--author", default="", help="Puzzle author.")
     parser.add_argument(
+        "--format",
+        choices=("puz", "ipuz"),
+        default="puz",
+        help="Output format (default: puz).",
+    )
+    parser.add_argument(
         "--no-ocr",
         action="store_true",
         help="Skip OCR and use sequential clue numbering only.",
@@ -466,6 +537,7 @@ def main(argv=None):
             title=args.title,
             author=args.author,
             use_ocr=not args.no_ocr,
+            output_format=args.format,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)

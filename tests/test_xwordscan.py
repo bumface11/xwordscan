@@ -219,6 +219,36 @@ class TestBuildPuz:
 
 
 # ---------------------------------------------------------------------------
+# build_ipuz
+# ---------------------------------------------------------------------------
+
+class TestBuildIpuz:
+    def test_grid_metadata_and_clues(self):
+        black_cells = [[False, False, False], [False, True, False], [False, False, False]]
+        cell_numbers = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+
+        puzzle = xwordscan.build_ipuz(
+            3,
+            3,
+            black_cells,
+            cell_numbers,
+            title="My Puzzle",
+            author="Jane",
+        )
+
+        assert puzzle["version"] == "http://ipuz.org/v2"
+        assert puzzle["kind"] == ["http://ipuz.org/crossword#1"]
+        assert puzzle["dimensions"] == {"width": 3, "height": 3}
+        assert puzzle["title"] == "My Puzzle"
+        assert puzzle["author"] == "Jane"
+        assert puzzle["puzzle"] == [[1, 0, 2], [0, "#", 0], [3, 0, 0]]
+        assert puzzle["clues"] == {
+            "Across": [[1, "1 Across"], [3, "3 Across"]],
+            "Down": [[1, "1 Down"], [2, "2 Down"]],
+        }
+
+
+# ---------------------------------------------------------------------------
 # preprocess
 # ---------------------------------------------------------------------------
 

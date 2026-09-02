@@ -69,6 +69,9 @@ uv run xwordscan grid.png --title "Daily Crossword" --author "A. Setter"
 
 # Skip OCR (use sequential clue numbering only)
 uv run xwordscan grid.png --no-ocr
+
+# Write an IPUZ file instead of PUZ
+uv run xwordscan grid.png --format ipuz
 ```
 
 ## Tips for best results
