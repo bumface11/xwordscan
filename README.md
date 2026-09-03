@@ -6,9 +6,9 @@ A utility to convert an image of an empty crossword grid to [.puz format](https:
 
 1. **Preprocess** – converts to grayscale, denoises with a bilateral filter, normalises contrast, and binarises with an adaptive threshold to handle colour images, JPEG artefacts, shadows, and uneven lighting.
 2. **Deskew** – detects and corrects any rotation using the Hough line transform.
-3. **Detect grid** – finds the outer grid boundary via contour detection and crops to it.
+3. **Detect grid** – finds the outer grid boundary via contour detection, corrects perspective distortion, and crops to it.
 4. **Estimate dimensions** – counts horizontal and vertical grid lines from pixel projections to determine rows × columns.
-5. **Classify cells** – each cell is classified as black (filled) or white (empty) by its mean brightness.
+5. **Classify cells** – corrects broad scan shadows, then classifies each cell's interior as black (filled) or white (empty).
 6. **OCR for clue numbers** – for each white cell, the top-left quadrant (where the clue number is printed) is cropped, upscaled, sharpened, and binarised before being passed to [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) to read the number.
 7. **Build .puz** – assembles a valid `.puz` file using standard crossword clue-numbering rules.
 
@@ -62,13 +62,19 @@ pip install -r requirements.txt
 uv run xwordscan grid.jpg
 
 # Specify output file
-uv run xwordscan grid.png my_puzzle.puz
+uv run xwordscan grid.jpg my_puzzle.puz
 
 # Add metadata
-uv run xwordscan grid.png --title "Daily Crossword" --author "A. Setter"
+uv run xwordscan grid.jpg --title "Daily Crossword" --author "A. Setter"
 
 # Skip OCR (use sequential clue numbering only)
-uv run xwordscan grid.png --no-ocr
+uv run xwordscan grid.jpg --no-ocr
+
+# Write an IPUZ file instead of PUZ
+uv run xwordscan grid.jpg --format ipuz
+
+# Save preprocessing stages and OCR input crops for inspection
+uv run xwordscan grid.jpg --debug-dir debug-images
 ```
 
 ## Tips for best results

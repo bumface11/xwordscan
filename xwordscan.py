@@ -18,6 +18,7 @@ Pipeline:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,11 +27,26 @@ import numpy as np
 import puz
 
 
+def _save_debug_image(
+    debug_dir: Path | None, filename: str, image: np.ndarray
+) -> None:
+    """Write a debug image when a debug directory is configured."""
+    if debug_dir is None:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    output_path = debug_dir / filename
+    if not cv2.imwrite(str(output_path), image):
+        raise OSError(f"Cannot write debug image: {output_path}")
+
+
 # ---------------------------------------------------------------------------
 # 1. Image preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
+def preprocess(
+    image_path: str, debug_dir: Path | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Load an image and return ``(gray, binary)`` after denoising and
     contrast normalisation.
@@ -44,12 +60,15 @@ def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
 
     # Convert to grayscale and remove colour/JPEG artefacts.
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _save_debug_image(debug_dir, "01-grayscale.png", gray)
 
     # Bilateral filter: removes noise while preserving edges (grid lines).
-    gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    _save_debug_image(debug_dir, "02-denoised.png", denoised)
 
     # Normalise contrast so faded prints and shadows are handled uniformly.
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    gray = cv2.normalize(denoised, None, 0, 255, cv2.NORM_MINMAX)
+    _save_debug_image(debug_dir, "03-normalized.png", gray)
 
     # Adaptive threshold → binary image with dark features on white background.
     binary = cv2.adaptiveThreshold(
@@ -59,10 +78,12 @@ def preprocess(image_path: str) -> tuple[np.ndarray, np.ndarray]:
         blockSize=15,
         C=10,
     )
+    _save_debug_image(debug_dir, "04-thresholded.png", binary)
 
     # Morphological closing to join broken grid lines.
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    _save_debug_image(debug_dir, "05-closed.png", binary)
 
     return gray, binary
 
@@ -131,12 +152,51 @@ def find_grid_bbox(binary: np.ndarray) -> tuple[int, int, int, int]:
     return cv2.boundingRect(largest)
 
 
+def _order_corners(corners: np.ndarray) -> np.ndarray:
+    """Return quadrilateral corners in top-left, top-right, bottom-right, bottom-left order."""
+    points = corners.reshape(4, 2).astype(np.float32)
+    sums = points.sum(axis=1)
+    differences = np.diff(points, axis=1).ravel()
+    return np.array([
+        points[np.argmin(sums)],
+        points[np.argmin(differences)],
+        points[np.argmax(sums)],
+        points[np.argmax(differences)],
+    ], dtype=np.float32)
+
+
 def crop_to_grid(
     gray: np.ndarray, binary: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Crop both images to the detected grid bounding box."""
-    x, y, w, h = find_grid_bbox(binary)
-    return gray[y : y + h, x : x + w], binary[y : y + h, x : x + w]
+    """Rectify and crop both images to the detected grid boundary."""
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        raise ValueError("No contours found – check that the image contains a grid.")
+    contour = max(contours, key=cv2.contourArea)
+    corners = cv2.approxPolyDP(contour, 0.04 * cv2.arcLength(contour, True), True)
+    if len(corners) != 4:
+        x, y, w, h = cv2.boundingRect(contour)
+        return gray[y : y + h, x : x + w], binary[y : y + h, x : x + w]
+
+    source = _order_corners(corners)
+    width = round(max(
+        np.linalg.norm(source[1] - source[0]),
+        np.linalg.norm(source[2] - source[3]),
+    ))
+    height = round(max(
+        np.linalg.norm(source[3] - source[0]),
+        np.linalg.norm(source[2] - source[1]),
+    ))
+    destination = np.array([
+        [0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1],
+    ], dtype=np.float32)
+    transform = cv2.getPerspectiveTransform(source, destination)
+    return (
+        cv2.warpPerspective(gray, transform, (width, height), flags=cv2.INTER_LINEAR),
+        cv2.warpPerspective(binary, transform, (width, height), flags=cv2.INTER_NEAREST),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +216,49 @@ def _count_line_groups(proj: np.ndarray, threshold: float) -> int:
     return groups
 
 
+def _grid_line_centres(binary_grid: np.ndarray, horizontal: bool) -> list[int]:
+    """Return centres of grid-rule groups after suppressing clue-number strokes."""
+    h, w = binary_grid.shape
+    if horizontal:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, w // 100), 1))
+        projection = cv2.morphologyEx(binary_grid, cv2.MORPH_OPEN, kernel).mean(axis=1)
+    else:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, h // 100)))
+        projection = cv2.morphologyEx(binary_grid, cv2.MORPH_OPEN, kernel).mean(axis=0)
+
+    centres = []
+    start = None
+    for index, is_line in enumerate(projection / 255.0 > 0.1):
+        if is_line and start is None:
+            start = index
+        elif not is_line and start is not None:
+            centres.append((start + index - 1) // 2)
+            start = None
+    if start is not None:
+        centres.append((start + len(projection) - 1) // 2)
+
+    merge_distance = max(3, min(h, w) // 100)
+    merged = []
+    for centre in centres:
+        if merged and centre - merged[-1][-1] <= merge_distance:
+            merged[-1].append(centre)
+        else:
+            merged.append([centre])
+    return [round(float(np.mean(group))) for group in merged]
+
+
+def _cells_from_line_centres(centres: list[int]) -> int | None:
+    """Estimate a cell count from visible grid-rule positions."""
+    if len(centres) < 2:
+        return None
+
+    gaps = np.diff(centres)
+    typical_gap = float(np.median(gaps[gaps <= np.percentile(gaps, 75)]))
+    if typical_gap <= 0:
+        return None
+    return max(1, round((centres[-1] - centres[0]) / typical_gap))
+
+
 def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
     """
     Estimate ``(rows, cols)`` by analysing horizontal and vertical line
@@ -166,10 +269,15 @@ def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
     h_proj = np.sum(binary_grid, axis=1).astype(float) / (w * 255)
     v_proj = np.sum(binary_grid, axis=0).astype(float) / (h * 255)
 
-    # 0.3 = 30 % of pixels in a row/column must be set to count as a grid line.
+    rows = _cells_from_line_centres(_grid_line_centres(binary_grid, horizontal=True))
+    cols = _cells_from_line_centres(_grid_line_centres(binary_grid, horizontal=False))
+    if rows is not None and cols is not None:
+        return rows, cols
+
+    # Fallback for sparse synthetic or severely degraded images.
     threshold = 0.3
-    rows = max(1, _count_line_groups(h_proj, threshold) - 1)
-    cols = max(1, _count_line_groups(v_proj, threshold) - 1)
+    rows = rows or max(1, _count_line_groups(h_proj, threshold) - 1)
+    cols = cols or max(1, _count_line_groups(v_proj, threshold) - 1)
     return rows, cols
 
 
@@ -177,33 +285,56 @@ def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
 # 5. Cell extraction and black-square detection
 # ---------------------------------------------------------------------------
 
+def normalize_grid_illumination(gray_grid: np.ndarray, cell_size: float) -> np.ndarray:
+    """Remove broad scan shadows while preserving the darker filled squares."""
+    background = cv2.GaussianBlur(gray_grid, (0, 0), max(1.0, cell_size))
+    return cv2.divide(gray_grid, background, scale=200)
+
+
 def extract_cells(
-    gray_grid: np.ndarray, rows: int, cols: int
+    gray_grid: np.ndarray,
+    rows: int,
+    cols: int,
+    binary_grid: np.ndarray | None = None,
 ) -> list[list[np.ndarray]]:
     """Slice the grid into a 2-D list of individual cell images."""
     h, w = gray_grid.shape
-    cell_h = h // rows
-    cell_w = w // cols
+    top, bottom, left, right = 0, h, 0, w
+    if binary_grid is not None:
+        horizontal_lines = _grid_line_centres(binary_grid, horizontal=True)
+        vertical_lines = _grid_line_centres(binary_grid, horizontal=False)
+        if len(horizontal_lines) >= 2:
+            top, bottom = horizontal_lines[0], horizontal_lines[-1]
+        if len(vertical_lines) >= 2:
+            left, right = vertical_lines[0], vertical_lines[-1]
+
     cells = []
     for r in range(rows):
         row_cells = []
         for c in range(cols):
-            y0, y1 = r * cell_h, (r + 1) * cell_h
-            x0, x1 = c * cell_w, (c + 1) * cell_w
+            y0 = round(top + r * (bottom - top) / rows)
+            y1 = round(top + (r + 1) * (bottom - top) / rows)
+            x0 = round(left + c * (right - left) / cols)
+            x1 = round(left + (c + 1) * (right - left) / cols)
             row_cells.append(gray_grid[y0:y1, x0:x1])
         cells.append(row_cells)
     return cells
 
 
-def is_black_cell(cell: np.ndarray, threshold: float = 0.5) -> bool:
+def is_black_cell(cell: np.ndarray, threshold: float = 0.65) -> bool:
     """
     Return True if the cell is mostly dark.
 
-    ``threshold`` is the brightness level (0–1 scale) below which a cell is
-    classified as black.  The default of 0.5 means cells whose mean pixel
-    brightness is below 50 % are treated as black squares.
+    ``threshold`` is the brightness level (0–1 scale) below which a cell's
+    interior is classified as black.
     """
-    return float(np.mean(cell)) / 255.0 < threshold
+    h, w = cell.shape
+    inset = max(1, round(min(h, w) * 0.08))
+    if h <= inset * 2 or w <= inset * 2:
+        interior = cell
+    else:
+        interior = cell[inset:-inset, inset:-inset]
+    return float(np.mean(interior)) / 255.0 < threshold
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +347,12 @@ def _prepare_number_crop(cell: np.ndarray, upscale_to: int = 96) -> np.ndarray:
     number is printed, then binarise and convert to BGR for PaddleOCR.
     """
     h, w = cell.shape
-    # Take the top-left 35 % of each dimension.
-    crop_h = max(1, int(h * 0.35))
-    crop_w = max(1, int(w * 0.35))
-    crop = cell[:crop_h, :crop_w]
+    # Skip the grid rule while retaining the top-left clue number.
+    inset_y = max(1, round(h * 0.05))
+    inset_x = max(1, round(w * 0.05))
+    crop_h = max(inset_y + 1, round(h * 0.35))
+    crop_w = max(inset_x + 1, round(w * 0.35))
+    crop = cell[inset_y:crop_h, inset_x:crop_w]
 
     # Upscale to a fixed size so small digits are large enough for OCR.
     crop_up = cv2.resize(crop, (upscale_to, upscale_to), interpolation=cv2.INTER_CUBIC)
@@ -238,6 +371,7 @@ def _prepare_number_crop(cell: np.ndarray, upscale_to: int = 96) -> np.ndarray:
 def read_cell_numbers(
     cells: list[list[np.ndarray]],
     black_cells: list[list[bool]],
+    debug_dir: Path | None = None,
 ) -> list[list[int]]:
     """
     Use PaddleOCR to read the clue number (integer ≥ 1) from the top-left
@@ -272,6 +406,11 @@ def read_cell_numbers(
                 continue
 
             crop_bgr = _prepare_number_crop(cells[r][c])
+            _save_debug_image(
+                debug_dir / "ocr-crops" if debug_dir else None,
+                f"row-{r + 1:02d}-col-{c + 1:02d}.png",
+                crop_bgr,
+            )
             ocr_results = ocr.predict(crop_bgr)
 
             num = 0
@@ -362,6 +501,57 @@ def build_puz(
     return puzzle
 
 
+def build_ipuz(
+    rows: int,
+    cols: int,
+    black_cells: list[list[bool]],
+    cell_numbers: list[list[int]],
+    title: str = "",
+    author: str = "",
+) -> dict:
+    """Assemble an IPUZ crossword document from the detected grid data."""
+    grid: list[list[int | str]] = []
+    across_clues: list[list[int | str]] = []
+    down_clues: list[list[int | str]] = []
+    clue_num = 1
+
+    for r in range(rows):
+        grid_row: list[int | str] = []
+        for c in range(cols):
+            if black_cells[r][c]:
+                grid_row.append("#")
+                continue
+
+            starts_across = (c == 0 or black_cells[r][c - 1]) and (
+                c + 1 < cols and not black_cells[r][c + 1]
+            )
+            starts_down = (r == 0 or black_cells[r - 1][c]) and (
+                r + 1 < rows and not black_cells[r + 1][c]
+            )
+            if starts_across or starts_down:
+                ocr_num = cell_numbers[r][c]
+                num = ocr_num if ocr_num == clue_num else clue_num
+                if starts_across:
+                    across_clues.append([num, f"{num} Across"])
+                if starts_down:
+                    down_clues.append([num, f"{num} Down"])
+                clue_num += 1
+            else:
+                num = 0
+            grid_row.append(num)
+        grid.append(grid_row)
+
+    return {
+        "version": "http://ipuz.org/v2",
+        "kind": ["http://ipuz.org/crossword#1"],
+        "title": title,
+        "author": author,
+        "dimensions": {"width": cols, "height": rows},
+        "puzzle": grid,
+        "clues": {"Across": across_clues, "Down": down_clues},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -372,7 +562,9 @@ def convert(
     title: str = "",
     author: str = "",
     use_ocr: bool = True,
-) -> puz.Puzzle:
+    output_format: str = "puz",
+    debug_dir: str | Path | None = None,
+) -> puz.Puzzle | dict:
     """
     Convert a crossword grid image to a .puz file.
 
@@ -389,45 +581,68 @@ def convert(
     use_ocr : bool
         Run PaddleOCR to detect clue numbers.  Set to False to rely solely
         on standard sequential numbering.
+    output_format : str
+        Output format: ``puz`` (default) or ``ipuz``.
+    debug_dir : str or pathlib.Path, optional
+        Directory for intermediate preprocessing images and OCR input crops.
 
     Returns
     -------
     puz.Puzzle
         The assembled puzzle (also saved to disk).
     """
+    debug_path = Path(debug_dir) if debug_dir else None
+
     # 1. Preprocess.
-    gray, binary = preprocess(image_path)
+    gray, binary = preprocess(image_path, debug_dir=debug_path)
 
     # 2. Deskew.
     gray, binary = deskew(gray, binary)
+    _save_debug_image(debug_path, "06-deskewed-grayscale.png", gray)
+    _save_debug_image(debug_path, "07-deskewed-binary.png", binary)
 
     # 3. Crop to grid.
     gray_grid, binary_grid = crop_to_grid(gray, binary)
+    _save_debug_image(debug_path, "08-grid-grayscale.png", gray_grid)
+    _save_debug_image(debug_path, "09-grid-binary.png", binary_grid)
 
     # 4. Estimate grid dimensions.
     rows, cols = detect_grid_size(binary_grid)
 
     # 5. Slice cells and classify black/white.
-    cells = extract_cells(gray_grid, rows, cols)
+    cell_size = min(gray_grid.shape[0] / rows, gray_grid.shape[1] / cols)
+    classification_grid = normalize_grid_illumination(gray_grid, cell_size)
+    cells = extract_cells(gray_grid, rows, cols, binary_grid)
+    classification_cells = extract_cells(classification_grid, rows, cols, binary_grid)
     black_cells = [
-        [is_black_cell(cells[r][c]) for c in range(cols)]
+        [is_black_cell(classification_cells[r][c]) for c in range(cols)]
         for r in range(rows)
     ]
 
     # 6. OCR for clue numbers.
     if use_ocr:
-        cell_numbers = read_cell_numbers(cells, black_cells)
+        cell_numbers = read_cell_numbers(cells, black_cells, debug_dir=debug_path)
     else:
         cell_numbers = [[0] * cols for _ in range(rows)]
 
-    # 7. Build and save .puz.
-    puzzle = build_puz(rows, cols, black_cells, cell_numbers, title=title, author=author)
+    # 7. Build and save the requested puzzle format.
+    if output_format == "puz":
+        puzzle = build_puz(rows, cols, black_cells, cell_numbers, title=title, author=author)
+    elif output_format == "ipuz":
+        puzzle = build_ipuz(rows, cols, black_cells, cell_numbers, title=title, author=author)
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
 
     if output_path is None:
-        output_path = str(Path(image_path).with_suffix(".puz"))
+        output_path = str(Path(image_path).with_suffix(f".{output_format}"))
 
-    puzzle.save(output_path)
-    print(f"Saved {rows}×{cols} puzzle to {output_path}")
+    if output_format == "puz":
+        puzzle.save(output_path)
+    else:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            json.dump(puzzle, output_file, indent=2)
+            output_file.write("\n")
+    print(f"Saved {rows}×{cols} {output_format.upper()} puzzle to {output_path}")
     return puzzle
 
 
@@ -453,6 +668,18 @@ def main(argv=None):
     parser.add_argument("--title", default="", help="Puzzle title.")
     parser.add_argument("--author", default="", help="Puzzle author.")
     parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        help="Save intermediate processing images and OCR input crops here.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("puz", "ipuz"),
+        default="puz",
+        help="Output format (default: puz).",
+    )
+    parser.add_argument(
         "--no-ocr",
         action="store_true",
         help="Skip OCR and use sequential clue numbering only.",
@@ -466,6 +693,8 @@ def main(argv=None):
             title=args.title,
             author=args.author,
             use_ocr=not args.no_ocr,
+            output_format=args.format,
+            debug_dir=args.debug_dir,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)

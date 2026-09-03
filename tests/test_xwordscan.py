@@ -5,6 +5,7 @@ These tests cover the pure-Python / NumPy logic that does not require
 PaddleOCR, a real image file, or the puz library to be installed.
 """
 
+import cv2
 import numpy as np
 import pytest
 
@@ -78,11 +79,37 @@ class TestDetectGridSize:
         assert rows == 15
         assert cols == 15
 
+    def test_21x21(self):
+        binary = self._make_grid_binary(21, 21)
+        rows, cols = xwordscan.detect_grid_size(binary)
+        assert rows == 21
+        assert cols == 21
+
     def test_rectangular(self):
         binary = self._make_grid_binary(7, 11)
         rows, cols = xwordscan.detect_grid_size(binary)
         assert rows == 7
         assert cols == 11
+
+
+class TestCropToGrid:
+    def test_rectifies_a_perspective_grid(self):
+        source = np.zeros((120, 120), dtype=np.uint8)
+        source[20:100, 20:100] = 255
+        binary = np.zeros((120, 120), dtype=np.uint8)
+        corners = np.array([[30, 15], [100, 25], [90, 105], [20, 95]], dtype=np.float32)
+        transform = cv2.getPerspectiveTransform(
+            np.array([[20, 20], [99, 20], [99, 99], [20, 99]], dtype=np.float32), corners
+        )
+        warped_gray = cv2.warpPerspective(source, transform, (120, 120))
+        warped_binary = cv2.warpPerspective(
+            np.pad(np.full((80, 80), 255, dtype=np.uint8), 20), transform, (120, 120)
+        )
+
+        gray_grid, binary_grid = xwordscan.crop_to_grid(warped_gray, warped_binary)
+
+        assert gray_grid.shape == binary_grid.shape
+        assert np.mean(gray_grid) > 200
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +141,22 @@ class TestIsBlackCell:
         cell[0:8, 0:8] = 20  # dark corner
         assert xwordscan.is_black_cell(cell) is False
 
+    def test_ignores_dark_grid_borders(self):
+        cell = np.full((100, 100), 220, dtype=np.uint8)
+        cell[:8, :] = 20
+        cell[:, :8] = 20
+
+        assert xwordscan.is_black_cell(cell) is False
+
+
+class TestNormalizeGridIllumination:
+    def test_corrects_a_gradual_shadow(self):
+        grid = np.tile(np.linspace(220, 100, 300, dtype=np.uint8), (300, 1))
+
+        normalized = xwordscan.normalize_grid_illumination(grid, cell_size=30)
+
+        assert abs(float(normalized[:, 20].mean()) - float(normalized[:, -20].mean())) <= 10
+
 
 # ---------------------------------------------------------------------------
 # extract_cells
@@ -138,6 +181,42 @@ class TestExtractCells:
         assert np.mean(cells[0][1]) == pytest.approx(128.0)
         assert np.mean(cells[1][0]) == pytest.approx(192.0)
         assert np.mean(cells[1][1]) == pytest.approx(255.0)
+
+    def test_uses_entire_grid(self):
+        gray = np.zeros((101, 101), dtype=np.uint8)
+        gray[-1, -1] = 255
+
+        cells = xwordscan.extract_cells(gray, rows=5, cols=5)
+
+        assert cells[-1][-1][-1, -1] == 255
+
+    def test_uses_detected_outer_grid_rules(self):
+        gray = np.zeros((120, 120), dtype=np.uint8)
+        gray[10:110, 10:110] = 255
+        binary = np.zeros((120, 120), dtype=np.uint8)
+        binary[10, 10:110] = 255
+        binary[109, 10:110] = 255
+        binary[10:110, 10] = 255
+        binary[10:110, 109] = 255
+
+        cells = xwordscan.extract_cells(gray, rows=1, cols=1, binary_grid=binary)
+
+        assert np.mean(cells[0][0]) == pytest.approx(255.0)
+
+
+# ---------------------------------------------------------------------------
+# _prepare_number_crop
+# ---------------------------------------------------------------------------
+
+class TestPrepareNumberCrop:
+    def test_excludes_cell_border(self):
+        cell = np.full((100, 100), 255, dtype=np.uint8)
+        cell[:5, :] = 0
+        cell[:, :5] = 0
+
+        crop = xwordscan._prepare_number_crop(cell, upscale_to=20)
+
+        assert np.all(crop == 255)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +244,21 @@ class TestReadCellNumbers:
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
         }
+
+    def test_saves_prepared_ocr_crop(self, monkeypatch, tmp_path):
+        class FakeOCR:
+            def __init__(self, **kwargs):
+                pass
+
+            def predict(self, image):
+                return [{"rec_texts": []}]
+
+        monkeypatch.setitem(sys.modules, "paddleocr", types.SimpleNamespace(PaddleOCR=FakeOCR))
+        cells = [[np.full((20, 20), 255, dtype=np.uint8)]]
+
+        xwordscan.read_cell_numbers(cells, [[False]], debug_dir=tmp_path)
+
+        assert (tmp_path / "ocr-crops" / "row-01-col-01.png").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +313,36 @@ class TestBuildPuz:
 
 
 # ---------------------------------------------------------------------------
+# build_ipuz
+# ---------------------------------------------------------------------------
+
+class TestBuildIpuz:
+    def test_grid_metadata_and_clues(self):
+        black_cells = [[False, False, False], [False, True, False], [False, False, False]]
+        cell_numbers = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+
+        puzzle = xwordscan.build_ipuz(
+            3,
+            3,
+            black_cells,
+            cell_numbers,
+            title="My Puzzle",
+            author="Jane",
+        )
+
+        assert puzzle["version"] == "http://ipuz.org/v2"
+        assert puzzle["kind"] == ["http://ipuz.org/crossword#1"]
+        assert puzzle["dimensions"] == {"width": 3, "height": 3}
+        assert puzzle["title"] == "My Puzzle"
+        assert puzzle["author"] == "Jane"
+        assert puzzle["puzzle"] == [[1, 0, 2], [0, "#", 0], [3, 0, 0]]
+        assert puzzle["clues"] == {
+            "Across": [[1, "1 Across"], [3, "3 Across"]],
+            "Down": [[1, "1 Down"], [2, "2 Down"]],
+        }
+
+
+# ---------------------------------------------------------------------------
 # preprocess
 # ---------------------------------------------------------------------------
 
@@ -231,6 +355,22 @@ class TestPreprocess:
         cv2.imwrite(img_path, np.full((100, 100, 3), 255, dtype=np.uint8))
         gray, binary = xwordscan.preprocess(img_path)
         assert gray.shape == binary.shape
+
+    def test_saves_intermediate_images(self, tmp_path):
+        import cv2  # noqa: PLC0415
+        img_path = str(tmp_path / "white.png")
+        cv2.imwrite(img_path, np.full((100, 100, 3), 255, dtype=np.uint8))
+
+        xwordscan.preprocess(img_path, debug_dir=tmp_path / "debug")
+
+        debug_dir = tmp_path / "debug"
+        assert {path.name for path in debug_dir.iterdir()} == {
+            "01-grayscale.png",
+            "02-denoised.png",
+            "03-normalized.png",
+            "04-thresholded.png",
+            "05-closed.png",
+        }
 
     def test_missing_file(self):
         with pytest.raises(FileNotFoundError):
