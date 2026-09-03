@@ -5,6 +5,7 @@ These tests cover the pure-Python / NumPy logic that does not require
 PaddleOCR, a real image file, or the puz library to be installed.
 """
 
+import cv2
 import numpy as np
 import pytest
 
@@ -91,6 +92,26 @@ class TestDetectGridSize:
         assert cols == 11
 
 
+class TestCropToGrid:
+    def test_rectifies_a_perspective_grid(self):
+        source = np.zeros((120, 120), dtype=np.uint8)
+        source[20:100, 20:100] = 255
+        binary = np.zeros((120, 120), dtype=np.uint8)
+        corners = np.array([[30, 15], [100, 25], [90, 105], [20, 95]], dtype=np.float32)
+        transform = cv2.getPerspectiveTransform(
+            np.array([[20, 20], [99, 20], [99, 99], [20, 99]], dtype=np.float32), corners
+        )
+        warped_gray = cv2.warpPerspective(source, transform, (120, 120))
+        warped_binary = cv2.warpPerspective(
+            np.pad(np.full((80, 80), 255, dtype=np.uint8), 20), transform, (120, 120)
+        )
+
+        gray_grid, binary_grid = xwordscan.crop_to_grid(warped_gray, warped_binary)
+
+        assert gray_grid.shape == binary_grid.shape
+        assert np.mean(gray_grid) > 200
+
+
 # ---------------------------------------------------------------------------
 # is_black_cell
 # ---------------------------------------------------------------------------
@@ -119,6 +140,22 @@ class TestIsBlackCell:
         cell = np.full((40, 40), 240, dtype=np.uint8)
         cell[0:8, 0:8] = 20  # dark corner
         assert xwordscan.is_black_cell(cell) is False
+
+    def test_ignores_dark_grid_borders(self):
+        cell = np.full((100, 100), 220, dtype=np.uint8)
+        cell[:8, :] = 20
+        cell[:, :8] = 20
+
+        assert xwordscan.is_black_cell(cell) is False
+
+
+class TestNormalizeGridIllumination:
+    def test_corrects_a_gradual_shadow(self):
+        grid = np.tile(np.linspace(220, 100, 300, dtype=np.uint8), (300, 1))
+
+        normalized = xwordscan.normalize_grid_illumination(grid, cell_size=30)
+
+        assert abs(float(normalized[:, 20].mean()) - float(normalized[:, -20].mean())) <= 10
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +189,19 @@ class TestExtractCells:
         cells = xwordscan.extract_cells(gray, rows=5, cols=5)
 
         assert cells[-1][-1][-1, -1] == 255
+
+    def test_uses_detected_outer_grid_rules(self):
+        gray = np.zeros((120, 120), dtype=np.uint8)
+        gray[10:110, 10:110] = 255
+        binary = np.zeros((120, 120), dtype=np.uint8)
+        binary[10, 10:110] = 255
+        binary[109, 10:110] = 255
+        binary[10:110, 10] = 255
+        binary[10:110, 109] = 255
+
+        cells = xwordscan.extract_cells(gray, rows=1, cols=1, binary_grid=binary)
+
+        assert np.mean(cells[0][0]) == pytest.approx(255.0)
 
 
 # ---------------------------------------------------------------------------

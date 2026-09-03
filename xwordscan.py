@@ -152,12 +152,51 @@ def find_grid_bbox(binary: np.ndarray) -> tuple[int, int, int, int]:
     return cv2.boundingRect(largest)
 
 
+def _order_corners(corners: np.ndarray) -> np.ndarray:
+    """Return quadrilateral corners in top-left, top-right, bottom-right, bottom-left order."""
+    points = corners.reshape(4, 2).astype(np.float32)
+    sums = points.sum(axis=1)
+    differences = np.diff(points, axis=1).ravel()
+    return np.array([
+        points[np.argmin(sums)],
+        points[np.argmin(differences)],
+        points[np.argmax(sums)],
+        points[np.argmax(differences)],
+    ], dtype=np.float32)
+
+
 def crop_to_grid(
     gray: np.ndarray, binary: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Crop both images to the detected grid bounding box."""
-    x, y, w, h = find_grid_bbox(binary)
-    return gray[y : y + h, x : x + w], binary[y : y + h, x : x + w]
+    """Rectify and crop both images to the detected grid boundary."""
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        raise ValueError("No contours found – check that the image contains a grid.")
+    contour = max(contours, key=cv2.contourArea)
+    corners = cv2.approxPolyDP(contour, 0.04 * cv2.arcLength(contour, True), True)
+    if len(corners) != 4:
+        x, y, w, h = cv2.boundingRect(contour)
+        return gray[y : y + h, x : x + w], binary[y : y + h, x : x + w]
+
+    source = _order_corners(corners)
+    width = round(max(
+        np.linalg.norm(source[1] - source[0]),
+        np.linalg.norm(source[2] - source[3]),
+    ))
+    height = round(max(
+        np.linalg.norm(source[3] - source[0]),
+        np.linalg.norm(source[2] - source[1]),
+    ))
+    destination = np.array([
+        [0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1],
+    ], dtype=np.float32)
+    transform = cv2.getPerspectiveTransform(source, destination)
+    return (
+        cv2.warpPerspective(gray, transform, (width, height), flags=cv2.INTER_LINEAR),
+        cv2.warpPerspective(binary, transform, (width, height), flags=cv2.INTER_NEAREST),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -246,31 +285,56 @@ def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
 # 5. Cell extraction and black-square detection
 # ---------------------------------------------------------------------------
 
+def normalize_grid_illumination(gray_grid: np.ndarray, cell_size: float) -> np.ndarray:
+    """Remove broad scan shadows while preserving the darker filled squares."""
+    background = cv2.GaussianBlur(gray_grid, (0, 0), max(1.0, cell_size))
+    return cv2.divide(gray_grid, background, scale=200)
+
+
 def extract_cells(
-    gray_grid: np.ndarray, rows: int, cols: int
+    gray_grid: np.ndarray,
+    rows: int,
+    cols: int,
+    binary_grid: np.ndarray | None = None,
 ) -> list[list[np.ndarray]]:
     """Slice the grid into a 2-D list of individual cell images."""
     h, w = gray_grid.shape
+    top, bottom, left, right = 0, h, 0, w
+    if binary_grid is not None:
+        horizontal_lines = _grid_line_centres(binary_grid, horizontal=True)
+        vertical_lines = _grid_line_centres(binary_grid, horizontal=False)
+        if len(horizontal_lines) >= 2:
+            top, bottom = horizontal_lines[0], horizontal_lines[-1]
+        if len(vertical_lines) >= 2:
+            left, right = vertical_lines[0], vertical_lines[-1]
+
     cells = []
     for r in range(rows):
         row_cells = []
         for c in range(cols):
-            y0, y1 = round(r * h / rows), round((r + 1) * h / rows)
-            x0, x1 = round(c * w / cols), round((c + 1) * w / cols)
+            y0 = round(top + r * (bottom - top) / rows)
+            y1 = round(top + (r + 1) * (bottom - top) / rows)
+            x0 = round(left + c * (right - left) / cols)
+            x1 = round(left + (c + 1) * (right - left) / cols)
             row_cells.append(gray_grid[y0:y1, x0:x1])
         cells.append(row_cells)
     return cells
 
 
-def is_black_cell(cell: np.ndarray, threshold: float = 0.5) -> bool:
+def is_black_cell(cell: np.ndarray, threshold: float = 0.65) -> bool:
     """
     Return True if the cell is mostly dark.
 
-    ``threshold`` is the brightness level (0–1 scale) below which a cell is
-    classified as black.  The default of 0.5 means cells whose mean pixel
-    brightness is below 50 % are treated as black squares.
+    ``threshold`` is the brightness level (0–1 scale) below which a cell's
+    interior is classified as black.
     """
-    return float(np.mean(cell)) / 255.0 < threshold
+    h, w = cell.shape
+    inset = max(1, round(min(h, w) * 0.08))
+    if h <= inset * 2 or w <= inset * 2:
+        interior = cell
+    else:
+        interior = cell[inset:-inset, inset:-inset]
+    return float(np.mean(interior)) / 255.0 < threshold
 
 
 # ---------------------------------------------------------------------------
@@ -546,9 +610,12 @@ def convert(
     rows, cols = detect_grid_size(binary_grid)
 
     # 5. Slice cells and classify black/white.
-    cells = extract_cells(gray_grid, rows, cols)
+    cell_size = min(gray_grid.shape[0] / rows, gray_grid.shape[1] / cols)
+    classification_grid = normalize_grid_illumination(gray_grid, cell_size)
+    cells = extract_cells(gray_grid, rows, cols, binary_grid)
+    classification_cells = extract_cells(classification_grid, rows, cols, binary_grid)
     black_cells = [
-        [is_black_cell(cells[r][c]) for c in range(cols)]
+        [is_black_cell(classification_cells[r][c]) for c in range(cols)]
         for r in range(rows)
     ]
 
