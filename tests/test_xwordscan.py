@@ -78,6 +78,12 @@ class TestDetectGridSize:
         assert rows == 15
         assert cols == 15
 
+    def test_21x21(self):
+        binary = self._make_grid_binary(21, 21)
+        rows, cols = xwordscan.detect_grid_size(binary)
+        assert rows == 21
+        assert cols == 21
+
     def test_rectangular(self):
         binary = self._make_grid_binary(7, 11)
         rows, cols = xwordscan.detect_grid_size(binary)
@@ -138,6 +144,29 @@ class TestExtractCells:
         assert np.mean(cells[0][1]) == pytest.approx(128.0)
         assert np.mean(cells[1][0]) == pytest.approx(192.0)
         assert np.mean(cells[1][1]) == pytest.approx(255.0)
+
+    def test_uses_entire_grid(self):
+        gray = np.zeros((101, 101), dtype=np.uint8)
+        gray[-1, -1] = 255
+
+        cells = xwordscan.extract_cells(gray, rows=5, cols=5)
+
+        assert cells[-1][-1][-1, -1] == 255
+
+
+# ---------------------------------------------------------------------------
+# _prepare_number_crop
+# ---------------------------------------------------------------------------
+
+class TestPrepareNumberCrop:
+    def test_excludes_cell_border(self):
+        cell = np.full((100, 100), 255, dtype=np.uint8)
+        cell[:5, :] = 0
+        cell[:, :5] = 0
+
+        crop = xwordscan._prepare_number_crop(cell, upscale_to=20)
+
+        assert np.all(crop == 255)
 
 
 # ---------------------------------------------------------------------------

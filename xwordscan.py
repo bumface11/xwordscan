@@ -177,6 +177,49 @@ def _count_line_groups(proj: np.ndarray, threshold: float) -> int:
     return groups
 
 
+def _grid_line_centres(binary_grid: np.ndarray, horizontal: bool) -> list[int]:
+    """Return centres of grid-rule groups after suppressing clue-number strokes."""
+    h, w = binary_grid.shape
+    if horizontal:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, w // 100), 1))
+        projection = cv2.morphologyEx(binary_grid, cv2.MORPH_OPEN, kernel).mean(axis=1)
+    else:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, h // 100)))
+        projection = cv2.morphologyEx(binary_grid, cv2.MORPH_OPEN, kernel).mean(axis=0)
+
+    centres = []
+    start = None
+    for index, is_line in enumerate(projection / 255.0 > 0.1):
+        if is_line and start is None:
+            start = index
+        elif not is_line and start is not None:
+            centres.append((start + index - 1) // 2)
+            start = None
+    if start is not None:
+        centres.append((start + len(projection) - 1) // 2)
+
+    merge_distance = max(3, min(h, w) // 100)
+    merged = []
+    for centre in centres:
+        if merged and centre - merged[-1][-1] <= merge_distance:
+            merged[-1].append(centre)
+        else:
+            merged.append([centre])
+    return [round(float(np.mean(group))) for group in merged]
+
+
+def _cells_from_line_centres(centres: list[int]) -> int | None:
+    """Estimate a cell count from visible grid-rule positions."""
+    if len(centres) < 2:
+        return None
+
+    gaps = np.diff(centres)
+    typical_gap = float(np.median(gaps[gaps <= np.percentile(gaps, 75)]))
+    if typical_gap <= 0:
+        return None
+    return max(1, round((centres[-1] - centres[0]) / typical_gap))
+
+
 def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
     """
     Estimate ``(rows, cols)`` by analysing horizontal and vertical line
@@ -187,10 +230,15 @@ def detect_grid_size(binary_grid: np.ndarray) -> tuple[int, int]:
     h_proj = np.sum(binary_grid, axis=1).astype(float) / (w * 255)
     v_proj = np.sum(binary_grid, axis=0).astype(float) / (h * 255)
 
-    # 0.3 = 30 % of pixels in a row/column must be set to count as a grid line.
+    rows = _cells_from_line_centres(_grid_line_centres(binary_grid, horizontal=True))
+    cols = _cells_from_line_centres(_grid_line_centres(binary_grid, horizontal=False))
+    if rows is not None and cols is not None:
+        return rows, cols
+
+    # Fallback for sparse synthetic or severely degraded images.
     threshold = 0.3
-    rows = max(1, _count_line_groups(h_proj, threshold) - 1)
-    cols = max(1, _count_line_groups(v_proj, threshold) - 1)
+    rows = rows or max(1, _count_line_groups(h_proj, threshold) - 1)
+    cols = cols or max(1, _count_line_groups(v_proj, threshold) - 1)
     return rows, cols
 
 
@@ -203,14 +251,12 @@ def extract_cells(
 ) -> list[list[np.ndarray]]:
     """Slice the grid into a 2-D list of individual cell images."""
     h, w = gray_grid.shape
-    cell_h = h // rows
-    cell_w = w // cols
     cells = []
     for r in range(rows):
         row_cells = []
         for c in range(cols):
-            y0, y1 = r * cell_h, (r + 1) * cell_h
-            x0, x1 = c * cell_w, (c + 1) * cell_w
+            y0, y1 = round(r * h / rows), round((r + 1) * h / rows)
+            x0, x1 = round(c * w / cols), round((c + 1) * w / cols)
             row_cells.append(gray_grid[y0:y1, x0:x1])
         cells.append(row_cells)
     return cells
@@ -237,10 +283,12 @@ def _prepare_number_crop(cell: np.ndarray, upscale_to: int = 96) -> np.ndarray:
     number is printed, then binarise and convert to BGR for PaddleOCR.
     """
     h, w = cell.shape
-    # Take the top-left 35 % of each dimension.
-    crop_h = max(1, int(h * 0.35))
-    crop_w = max(1, int(w * 0.35))
-    crop = cell[:crop_h, :crop_w]
+    # Skip the grid rule while retaining the top-left clue number.
+    inset_y = max(1, round(h * 0.05))
+    inset_x = max(1, round(w * 0.05))
+    crop_h = max(inset_y + 1, round(h * 0.35))
+    crop_w = max(inset_x + 1, round(w * 0.35))
+    crop = cell[inset_y:crop_h, inset_x:crop_w]
 
     # Upscale to a fixed size so small digits are large enough for OCR.
     crop_up = cv2.resize(crop, (upscale_to, upscale_to), interpolation=cv2.INTER_CUBIC)
